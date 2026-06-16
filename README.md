@@ -1,6 +1,8 @@
 # ER1-uboot-gpt
 
-京东云太亚（JDCloud AX1800 / RE-CS-02）的 U-Boot 与 GPT 分区相关资源。
+京东云太乙（RE-CS-07）的 U-Boot 与 GPT 分区相关资源。
+
+
 
 ---
 
@@ -11,7 +13,7 @@
 | `JDC-TAIYI-1GB-GPT.bin` | 原始 GPT 导出的 34 扇区镜像（18 个分区，HLOS = 6MB，1GB rootfs） |
 | `JDC-TAIYI-1GB-GPT-MODIFIED.bin` | 修改版 GPT（HLOS 扩至 12MB + 新增 HLOS_1 备份分区，适应 daed/BPF 需求） |
 | `uboot-chenxin-er.bin` | chenxin527 编译的 U-Boot（gl.inet 风格，仅认 6M/12M 内核） |
-| `uboot.bin` | 其他版本 U-Boot |
+| `uboot.bin` | 其他版本 U-Boot hugo大佬的uboot不带dhcp|
 | `chenxin.txt` | [chenxin527/uboot-ipq60xx-emmc-build](https://github.com/chenxin527/uboot-ipq60xx-emmc-build) 源码分析 |
 | `xiaozhu.txt` | [1980490718/u-boot-2016](https://github.com/1980490718/u-boot-2016) 源码分析 |
 | `教程.txt` | 完整刷写教程（三种方案） |
