@@ -1,0 +1,435 @@
+# JDCloud AX1800 (IPQ60XX) 改装教程 — 扩大 HLOS 分区以支持 daed
+
+> 目标：把内核分区（0:HLOS）从 6MB 扩大到 12MB，刷新 U-Boot，刷入支持 daede 的新固件
+> 背景：原厂 6MB 内核放不下 BPF/XDP，daed 需要至少 12MB
+
+---
+
+## 整体思路
+
+三种方案，安全程度从高到低：
+
+---
+
+## 方案一：initramfs 过渡（最安全，推荐新手）
+
+这种方案的核心是：先让系统运行在内存里（不依赖 eMMC 分区），然后随便改分区表。
+
+### 步骤 1：编译 initramfs 镜像
+
+在当前 OpenWRT 编译配置中，生成一个 initramfs：
+```bash
+# 在编译目录执行
+make image FILES=files/ EXTRA_IMAGE_KERNEL_PARTSIZE=12
+# 或者单独编译 initramfs
+make target/linux/install
+```
+生成的镜像通常在 `bin/targets/qualcommax/ipq60xx/` 下，类似
+`openwrt-qualcommax-ipq60xx-jdcloud_re-cs-02-initramfs-uImage.itb`
+
+### 步骤 2：刷 U-Boot
+
+```bash
+# SSH 进当前系统
+# 把 U-Boot 传上去（scp chenxin527 或 1980490718 编译好的 u-boot.elf）
+scp u-boot.elf root@192.168.1.1:/tmp/
+
+# 刷入 U-Boot（注意：你的设备 U-Boot 在哪个 mtd 分区）
+cat /proc/mtd  # 查看分区表
+# 通常叫 "APPSBL" 或 "0:APPSBL"
+mtd write /tmp/u-boot.elf APPSBL
+mtd write /tmp/u-boot.elf APPSBL_1  # 刷双备份
+```
+
+### 步骤 3：重启进入 initramfs
+
+```bash
+# 方法 A：用 U-Boot 命令行 tftp 加载
+# 重启 → 按任意键停住 U-Boot → 执行：
+# tftpboot 0x44000000 openwrt-initramfs-uImage.itb
+# bootm 0x44000000
+
+# 方法 B：用 OpenWRT sysupgrade 直接刷 initramfs
+sysupgrade -F -n openwrt-initramfs-uImage.itb
+```
+
+### 步骤 4：在 initramfs 里改分区表
+
+```bash
+# 此时系统运行在内存里，eMMC 没挂载
+# 安装 gdisk/parted
+opkg update && opkg install gdisk
+
+# 查看当前分区
+sgdisk -p /dev/mmcblk0
+
+# 假设 HLOS 是分区 16，记录当前起始扇区
+ST=$(sgdisk -i 16 /dev/mmcblk0 | grep "Partition offset" | awk '{print $3}')
+echo "HLOS 起始扇区: $ST"
+
+# 删除 HLOS 和 rootfs（分区号根据实际调整）
+sgdisk -d 16 /dev/mmcblk0   # 删 HLOS
+sgdisk -d 17 /dev/mmcblk0   # 删 rootfs
+
+# 重新创建：HLOS 变 12MB，rootfs 占剩余
+sgdisk -n 16:$ST:+12M -t 16:8300 -c 16:"0:HLOS" /dev/mmcblk0
+# rootfs 从 HLOS 之后开始，占满剩余空间
+ROOTFS_ST=$((ST + 12*1024*1024/512))
+sgdisk -n 17:$ROOTFS_ST:0 -t 17:8300 -c 17:"rootfs" /dev/mmcblk0
+
+# 验证
+sgdisk -p /dev/mmcblk0
+```
+
+### 步骤 5：刷新固件
+
+```bash
+# 上传编译好的 12MB 内核固件
+scp openwrt-12k-kernel.bin root@192.168.1.1:/tmp/
+
+# 直接刷（不要重启）
+sysupgrade -F -n /tmp/openwrt-12k-kernel.bin
+# 或者手动 dd 写入对应位置
+# dd if=/tmp/firmware.bin of=/dev/mmcblk0 bs=512 seek=$HLOS_START
+```
+
+### 步骤 6：重启验证
+
+```bash
+reboot
+# 重启后用 uname -a 确认内核版本
+# 检查 daed 是否正常运行
+```
+
+---
+
+## 方案二：SSH 一步到位（最快，风险中等）
+
+直接在运行的系统中改 GPT，写入新固件，再重启。
+
+```bash
+# === 准备阶段 ===
+# 1. 上传文件
+scp u-boot.elf root@192.168.1.1:/tmp/
+scp openwrt-12k-kernel.bin root@192.168.1.1:/tmp/
+
+# 2. 刷 U-Boot
+mtd write /tmp/u-boot.elf APPSBL
+mtd write /tmp/u-boot.elf APPSBL_1
+
+# === 改分区表（核心操作）===
+# 当前分区布局（假设）：
+# /dev/mmcblk0p16 = 0:HLOS  起始=LBA_N,  大小=6MB
+# /dev/mmcblk0p17 = rootfs   起始=LBA_N+12288, 大小=剩余
+
+# 获取 HLOS 起始 LBA
+ST=$(sgdisk -i 16 /dev/mmcblk0 | grep "Partition offset" | awk '{print $3}')
+
+# 删除并重建 HLOS（扩大为 12MB）
+sgdisk -d 16 /dev/mmcblk0
+sgdisk -n 16:$ST:+12M -t 16:8300 -c 16:"0:HLOS" /dev/mmcblk0
+
+# 此时 rootfs 分区号可能变了，重新确认
+sgdisk -p /dev/mmcblk0
+
+# 删重建 rootfs（起始位置后移 6MB）
+sgdisk -d 17 /dev/mmcblk0
+ROOTFS_ST=$((ST + 12*1024*1024/512))
+sgdisk -n 17:$ROOTFS_ST:0 -t 17:8300 -c 17:"rootfs" /dev/mmcblk0
+
+# 让内核重新读取分区表
+blockdev --rereadpt /dev/mmcblk0
+
+# === 写入新固件 ===
+# 固件格式通常是 FIT，包含 kernel + rootfs
+# 直接 dd 到整个 eMMC 的对应位置
+# 实际 LBA 偏移量需要从固件头部分析
+# 更安全：用 U-BOO 的 flash 命令写
+
+# 或者直接把固件写到 mmcblk0 的起始扇区
+dd if=/tmp/openwrt-12k-kernel.bin of=/dev/mmcblk0 bs=512 seek=$ST
+
+# === 重启验证 ===
+reboot
+```
+
+> ⚠️ 风险点：如果分区表写错了，重启直接变砖。需要 UART 线救砖。
+
+---
+
+## 方案三：U-Boot HTTPD 分步刷（最稳妥）
+
+利用 U-Boot 自带的网页恢复功能，分步操作。
+
+### 需要什么 U-Boot
+
+**1980490718** 的版本（推荐），因为它：
+- 网页上传支持 GPT 类型（识别 0xAA55 魔数）
+- 自动检测 HLOS 大小（4MB ~ 16MB）
+- 支持 initramfs 启动
+
+**chenxin527** 的版本也能用，但只认 6MB/12MB 两种规格。
+
+### 制作 GPT 镜像文件
+
+GPT 镜像是 eMMC 头部的前 N 个扇区（保护 MBR + GPT 头 + 分区条目）：
+
+```bash
+# 方法 A：从同型号设备导出（有设备的话）
+# SSH 进一个正常工作的同型号设备
+dd if=/dev/mmcblk0 of=gpt_master.img bs=512 count=34
+
+# 下载到电脑
+# 用十六进制编辑器（如 HxD）修改分区表条目
+# 把 HLOS 的结束 LBA 增加 6MB（=12288 扇区）
+# 把 rootfs 的起始 LBA 也相应增加 12288
+# 重新计算 GPT 头的 CRC32（可用 gpt-fix 工具）
+```
+
+```bash
+# 方法 B：用 sgdisk 从零制作（无设备可用）
+# 需要知道每个分区的准确偏移量
+# 这比较麻烦，因为 MIBIB、CDT、APPSBL 等都有固定 LBA
+```
+
+```bash
+# 方法 C：直接刷机时自动处理（推荐）
+# 很多第三方 U-Boot 支持刷写包含分区表的全量镜像
+# 上传 factory.img（包含正确 GPT 的完整 eMMC 镜像）
+```
+
+### 实际操作流程（利用 SSH + U-Boot HTTPD）
+
+两步走，不需要提前制作 GPT 镜像：
+
+```
+第一步（SSH 操作）：
+  1. 上传 U-Boot
+  2. 刷 U-Boot: mtd write /tmp/u-boot.elf APPSBL
+  3. reboot
+  4. 重启时长按 Reset 键（5秒以上）
+  5. 进入 U-Boot HTTPD 模式（LED 亮，IP: 192.168.1.1）
+
+第二步（浏览器操作，192.168.1.1）：
+  6. 打开网页，选择 "Firmware" 类型
+  7. 上传编译好的 12MB 内核固件
+  8. U-Boot 自动检测 HLOS 大小（12MB），
+     然后查 GPT 当前 HLOS 分区大小（6MB），
+     发现固件太大放不下 → 报错
+
+  ⚠️ 问题：GPT 还没改！
+
+  解决方法 A：选 "GPT" 类型，上传修改好的 gpt.bin
+  解决方法 B：选 "PTABLE" 类型，上传分区表
+  解决方法 C：选 "IMG" 类型，上传完整的 eMMC 镜像
+```
+
+### GPT 镜像制作详解（解决方法 A）
+
+```bash
+# 在当前 OpenWRT 上 dump GPT
+opkg install gdisk
+dd if=/dev/mmcblk0 of=/tmp/gpt.bin bs=512 count=34
+
+# 分析每个分区的偏移
+sgdisk -p /dev/mmcblk0
+
+# 典型 JDCloud AX1800 分区表：
+# 扇区大小 = 512 bytes
+# 编号  起始 LBA    大小      名称
+# 1      X          Y        0:MIBIB
+# 2      ...        ...      0:CDT
+# ...    ...        ...      ...
+# 16     N          12288    0:HLOS    ← 当前 6MB (12288 * 512 = 6,291,456 = 6MB)
+# 17     N+12288    ...      rootfs
+# ...
+
+# 下载到电脑上修改
+scp root@192.168.1.1:/tmp/gpt.bin ./
+
+# 用 Python 修改（以 512 字节 / 扇区 为单位）
+python3 << 'EOF'
+import struct
+import hashlib
+
+with open('gpt.bin', 'rb') as f:
+    data = bytearray(f.read())
+
+# GPT 头在 LBA 1（偏移 512 字节）
+# GPT 头结构（UEFI 标准）：
+# 偏移 0: 签名 "EFI PART"
+# 偏移 8: 修订版本
+# 偏移 12: 头大小
+# 偏移 16: CRC32（整个头）
+# 偏移 24: 保留
+# 偏移 32: 当前 LBA
+# 偏移 40: 备份 LBA
+# 偏移 48: 第一个可用 LBA
+# 偏移 56: 最后一个可用 LBA
+# 偏移 64: GUID
+# 偏移 72: 分区表起始 LBA
+# 偏移 80: 分区条目数
+# 偏移 84: 分区条目大小
+# 偏移 88: 分区表 CRC32
+
+# 分区条目从 LBA 2 开始（偏移 1024）
+# 每个分区条目 128 字节
+# 分区条目结构：
+# 偏移 0: 分区类型 GUID (16 bytes)
+# 偏移 16: 唯一 GUID (16 bytes)  
+# 偏移 32: 起始 LBA (8 bytes)
+# 偏移 40: 结束 LBA (8 bytes)
+# 偏移 48: 属性 (8 bytes)
+# 偏移 56: 名称 (72 bytes, UTF-16LE)
+
+# 找到 HLOS 分区条目（按名称搜索）
+import struct
+
+# 搜索 "0:HLOS" 的 UTF-16LE 编码
+hlos_name_utf16 = "0:HLOS\0".encode('utf-16-le')
+
+for i in range(128):  # 最多 128 个分区
+    entry_offset = 1024 + i * 128
+    name = data[entry_offset+56:entry_offset+128]
+    if hlos_name_utf16 in name:
+        # 找到 HLOS 分区
+        start_lba = struct.unpack('<Q', data[entry_offset+32:entry_offset+40])[0]
+        end_lba = struct.unpack('<Q', data[entry_offset+40:entry_offset+48])[0]
+        old_size_mb = (end_lba - start_lba + 1) * 512 / 1024 / 1024
+        print(f"Found HLOS: LBA {start_lba} -> {end_lba}, size = {old_size_mb:.0f}MB")
+        
+        # 扩大为 12MB (+6MB = +12288 扇区)
+        new_end_lba = end_lba + 12288
+        data[entry_offset+40:entry_offset+48] = struct.pack('<Q', new_end_lba)
+        print(f"New HLOS: LBA {start_lba} -> {new_end_lba}, size = 12MB")
+
+# 同时也要修改 rootfs 分区的起始 LBA（往后移 6MB）
+# rootfs 紧跟在 HLOS 之后
+rootfs_name_utf16 = "rootfs\0".encode('utf-16-le')
+for i in range(128):
+    entry_offset = 1024 + i * 128
+    name = data[entry_offset+56:entry_offset+128]
+    if rootfs_name_utf16 in name:
+        start_lba = struct.unpack('<Q', data[entry_offset+32:entry_offset+40])[0]
+        end_lba = struct.unpack('<Q', data[entry_offset+40:entry_offset+48])[0]
+        print(f"Found rootfs: LBA {start_lba} -> {end_lba}")
+        
+        # 起始往后移 12288 扇区
+        new_start_lba = start_lba + 12288
+        new_end_lba = end_lba + 12288
+        data[entry_offset+32:entry_offset+40] = struct.pack('<Q', new_start_lba)
+        data[entry_offset+40:entry_offset+48] = struct.pack('<Q', new_end_lba)
+        print(f"New rootfs: LBA {new_start_lba} -> {new_end_lba}")
+
+# 重新计算并更新 CRC32
+# 1. 计算分区表 CRC32（所有分区条目）
+# GPT 头偏移 80 = 分区条目数, 偏移 84 = 分区条目大小=128
+part_entries_offset = 1024  # LBA 2
+part_entry_count = struct.unpack('<I', data[80:84])[0]
+part_entry_size = struct.unpack('<I', data[84:88])[0]
+
+# 分区表所占字节
+table_bytes = part_entry_count * part_entry_size
+# 清零 CRC 字段
+data[88:92] = b'\x00\x00\x00\x00'
+# 计算分区表 CRC32
+import binascii
+table_crc = binascii.crc32(data[part_entries_offset:part_entries_offset+table_bytes]) & 0xFFFFFFFF
+data[88:92] = struct.pack('<I', table_crc)
+
+# 2. 计算 GPT 头 CRC32
+# GPT 头在 LBA 1（偏移 512），头大小通常在 92 字节
+header_offset = 512
+header_size = struct.unpack('<I', data[header_offset+12:header_offset+16])[0]
+# 清零头的 CRC 字段
+data[header_offset+16:header_offset+20] = b'\x00\x00\x00\x00'
+# 计算头 CRC32
+header_crc = binascii.crc32(data[header_offset:header_offset+header_size]) & 0xFFFFFFFF
+data[header_offset+16:header_offset+20] = struct.pack('<I', header_crc)
+
+# 保存修改后的 GPT
+with open('gpt_12mb_hlos.bin', 'wb') as f:
+    f.write(data)
+
+print("GPT image saved as gpt_12mb_hlos.bin")
+EOF
+
+# 文件大小应为 34*512 = 17408 字节
+# 传到设备备用
+scp gpt_12mb_hlos.bin root@192.168.1.1:/tmp/
+```
+
+### 完整流程（SSH + HTTPD 两步方案）
+
+```
+电脑 ←→ 路由器 (192.168.1.1)
+      ←→ 网络（获取固件）
+
+===== 第 1 步：SSH 操作 =====
+
+1. scp u-boot.bin root@192.168.1.1:/tmp/
+2. scp openwrt-12m-kernel.bin root@192.168.1.1:/tmp/
+3. ssh root@192.168.1.1
+4. mtd write /tmp/u-boot.bin APPSBL && mtd write /tmp/u-boot.bin APPSBL_1
+5. reboot
+
+===== 第 2 步：进入 U-Boot HTTPD =====
+
+6. 重启时长按 Reset 键（约 5 秒）
+7. 电脑网线连路由器 LAN 口
+8. 电脑设置静态 IP 192.168.1.2/24
+9. 浏览器打开 http://192.168.1.1
+
+===== 第 3 步：上传 GPT =====
+
+10. 在网页选择 "GPT" 类型
+11. 上传修改好的 gpt_12mb_hlos.bin
+12. U-Boot 会：
+    - 检测到 0xAA55 魔数 → 识别为 GPT
+    - 执行 mmc erase + mmc write 写入 eMMC 头部
+13. 页面显示 "Flashing..." → "Success" → 自动重启
+
+===== 第 4 步：再次进入 HTTPD 刷固件 =====
+
+14. 重启后再次按 Reset 键
+15. 浏览器再次打开 http://192.168.1.1
+16. 选择 "Firmware" 类型
+17. 上传 openwrt-12m-kernel.bin
+18. U-Boot 自动检测 HLOS=12MB，查 GPT 确认空间够 → 写入
+19. 刷完自动重启
+
+===== 验证 =====
+
+20. SSH 连上检查
+    uname -a
+    ls -la /sys/fs/bpf/
+    daed version
+```
+
+---
+
+## 方案对比总结
+
+| 方案 | 安全性 | 复杂度 | 特殊要求 | 推荐场景 |
+|------|--------|--------|----------|----------|
+| initramfs 过渡 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | 需编译 initramfs | 新手 / 首次操作 |
+| SSH 一步到位 | ⭐⭐⭐ | ⭐⭐ | sgdisk 熟练 | 老手快速操作 |
+| HTTPD 分步刷 | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ | 需制作 GPT 镜像 | 最稳妥的远程操作 |
+
+> 注意：所有方案前，**先备份当前分区表**：
+> ```bash
+> sgdisk -b /tmp/gpt_backup.bin /dev/mmcblk0
+> dd if=/dev/mmcblk0 of=/tmp/emmc_backup.bin bs=512 count=34
+> scp /tmp/gpt_backup.bin root@your-pc:~/jdcloud-backup/
+> scp /tmp/emmc_backup.bin root@your-pc:~/jdcloud-backup/
+> ```
+
+---
+
+## 关键风险提示
+
+1. **变砖风险是真实的** — 没有 UART 线的话，操作失败只能拆机救
+2. **先刷 U-Boot 再改 GPT** — 确保新 U-Boot 支持新分区布局
+3. **备份！备份！备份！** — 记下原始分区表
+4. **双分区更新** — HLOS_1 和 rootfs_1 是备份分区，一起更新
+5. **备份 GPT** — 只改主 GPT 不改备份 GPT 可能导致 U-Boot 校验失败
