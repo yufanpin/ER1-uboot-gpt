@@ -1,0 +1,159 @@
+# 1980490718/u-boot-2016 完整启动与固件升级分析
+
+## 设备
+- JDCloud AX1800 Pro / ER1 (IPQ6018, ARMv7 Cortex-A7)
+- eMMC 启动, 512MB DDR
+
+## 一、完整启动流程
+
+### Phase 1: 复位向量 (arch/arm/cpu/armv7/start.S)
+1. reset → save_boot_params → SVC32 模式, 关 IRQ/FIQ
+2. CP15 屏障使能 (IPQ 专用)
+3. 设 VBAR = _start
+4. cpu_init_cp15: 失效 TLB/Cache, 关 MMU/DCache, 开 ICache, 应用 Cortex-A7 勘误
+5. cpu_init_crit → lowlevel_init: GIC, DDR 控制器, PL310 L2 Cache
+
+### Phase 2: C 运行时 (arch/arm/lib/crt0.S - _main)
+1. 设栈 CONFIG_SYS_INIT_SP_ADDR
+2. board_init_f_mem → 初始化 GD
+3. **CONFIG_IPQ_NO_RELOC**: U-Boot 直接在 OCIMEM/SRAM 运行，不清 BSS、不搬 DDR
+4. board_init_f(0) → 执行 init_sequence_f
+
+### Phase 3: board_init_f (common/board_f.c)
+关键步骤: 串口初始化 → 打印版本 → DRAM init (从 SMEM 读 512MB) → 内存布局规划
+
+### Phase 4: board_init_r (common/board_r.c)
+关键步骤: 开 MMU/Cache → 板级 init → eMMC init → GPT 解析 → 网络 init → btn_init() + led_init()
+
+### Phase 5: main_loop (common/main.c)
+```
+main_loop()
+  ├→ btn_check_press()   ← Reset 键 ≥3 秒 → HTTPD 恢复模式
+  ├→ autoboot_command()   ← bootcmd="bootipq" → 正常启动
+  └→ cli_loop()           ← U-Boot 命令行
+```
+
+## 二、HTTPD 恢复模式
+
+### 触发
+Reset 键 (GPIO 12) 按下 ≥3 秒 → led 闪烁 → `run_command("httpd", 0)`
+
+### 网络
+- IP: 192.168.1.1
+- DHCP 池: 192.168.1.100-200
+- uIP 协议栈 + 内置 HTTP 服务器
+
+### 上传类型
+| 类型 | HTML name | 用途 |
+|------|-----------|------|
+| FIRMWARE | firmware | 固件升级 |
+| UBOOT | uboot | U-Boot 升级 |
+| GPT | img | 分区表 |
+| ART | art | 射频校准 |
+| CDT | cdt | 配置数据 |
+| MIBIB | mibib | MIBIB |
+| PTABLE | ptable | 分区表 |
+| INITRAMFS | initramfs | 内存启动 |
+
+## 三、固件结构
+
+```
+固件文件 = [内核 (FIT/uImage) | SquashFS rootfs]
+              ↑ 在 hsqs 魔数处分割
+```
+
+OpenWRT 固件是"内核 + SquashFS 文件系统"直接拼接。
+
+### check_fw_type_ex() - 内核大小检测
+```c
+// 扫描偏移: 4M, 6M, 8M, 12M, 14M, 16M
+// 找 "hsqs" (0x73717368) 魔数
+// 第一个匹配的偏移 = hlos_size (内核大小)
+// 未找到则默认 12MB
+```
+
+### HLOS 分区大小获取 (双重机制)
+1. **SMEM** (优先): `getpart_offset_size("0:HLOS")` → SBL1 填充的共享内存表
+2. **GPT** (回退): `get_partition_info_efi_by_name(mmc_dev, "0:HLOS")`
+
+## 四、固件升级流程
+
+### 写 HLOS (do_firmware_upgrade)
+```
+上传固件到 0x4B000000
+  → check_fw_type_ex() 找 hsqs → 内核大小 = 12MB
+  → 写前 12MB 到 "0:HLOS"
+  → 写 12MB 往后到 "rootfs"
+  → 同样内容到 "0:HLOS_1" 和 "rootfs_1" (A/B 双槽)
+  → update_bootconfig() 更新启动配置
+```
+
+### 读 HLOS (do_bootipq)
+```
+bootcmd=bootipq
+  → do_boot_unsignedimg()
+  → SMEM 检查 flash_type == SMEM_BOOT_MMC_FLASH
+  → 判断 A/B 槽 (BOOTCONFIG):
+     主槽 → "0:HLOS"
+     备用 → "0:HLOS_1"
+  → GPT 查分区 LBA:
+     get_partition_info_efi_by_name("0:HLOS", &disk_info)
+  → mmc read 到 0x44000000
+  → genimg_get_format() 判断 FIT/legacy
+  → FIT: config_select() 选 DTB → update_bootargs()
+  → boot_os() → do_bootm_states() → 启动 Linux
+```
+
+### Rootfs 定位 (set_fs_bootargs)
+```
+setenv("bootargs", "root=PARTUUID=<rootfs_uuid> rootwait")
+或: "rootfsname=rootfs gpt"
+```
+内核通过 GPT UUID 或分区名自己找 rootfs，跟 LBA 偏移无关。
+
+## 五、A/B 双槽机制
+
+### BOOTCONFIG 结构
+```c
+qca_smem_bootconfig_info_t {
+    magic_start = 0xA3A2A1A0
+    per_part_entry[] {
+        name[16]       // "0:HLOS" / "rootfs"
+        primaryboot    // 1=主槽, 0=备用
+    }
+    magic_end = 0xB3B2B1B0
+}
+```
+
+### update_bootconfig()
+1. 读当前 BOOTCONFIG → 清偏移 0x80/0x94/0xA8 字节 (标记"尝试"状态)
+2. 写回 BOOTCONFIG 和 BOOTCONFIG1
+
+## 六、HLOS 分区扩大的兼容性
+
+### 扫描上限: 16MB
+check_fw_type_ex() 最多扫描到 0x1000000 (16MB)，所以内核 ≤16MB 都能识别。
+
+### 分区大小校验
+```
+if (hlos_size > get_hlos_size()) → 报错
+```
+所以 HLOS 分区设 ≥ 实际内核大小即可。
+
+### rootfs 定位不受影响
+U-Boot 找 rootfs 靠 GPT 分区名查 LBA，不是从 HLOS 末尾推算。HLOS 改大 rootfs 自动后移，但 U-Boot 不在乎。
+
+## 七、与 chenxin527 版本对比
+
+| 特性 | chenxin527 | 1980490718 |
+|------|-----------|------------|
+| HLOS 检测 | 6MB/12MB 硬编码 | 4MB~16MB 自动 |
+| 自动识别 | 仅 FIT, JDCLOUD, SYSUPGRADE | FIT, QSDK, UBI, GPT, CDT, ELF, MIBIB |
+| 升级写入 | HLOS + rootfs | HLOS + rootfs + HLOS_1 + rootfs_1 |
+| BOOTCONFIG | 无 | 自动更新 |
+| GPIO | 仅 led/button | 完整 gpio 命令 + led/button + DTS |
+| PHY 监测 | 无 | eth_check_link_change() |
+| initramfs | 不支持 | 支持 |
+| WebTerm | 不支持 | 支持 |
+| 按键自定义 | 仅 DTS | DTS + env reset_key 覆盖 |
+| 分区大小来源 | image_greater_than_partition() 硬比 | SMEM 优先 → GPT 回退 |

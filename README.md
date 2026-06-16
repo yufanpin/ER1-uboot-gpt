@@ -2,8 +2,6 @@
 
 京东云太乙（RE-CS-07）的 U-Boot 与 GPT 分区相关资源。
 
-
-
 ---
 
 ## 仓库文件说明
@@ -12,10 +10,12 @@
 |------|------|
 | `JDC-TAIYI-1GB-GPT.bin` | 原始 GPT 导出的 34 扇区镜像（18 个分区，HLOS = 6MB，1GB rootfs） |
 | `JDC-TAIYI-1GB-GPT-MODIFIED.bin` | 修改版 GPT（HLOS 扩至 12MB + 新增 HLOS_1 备份分区，适应 daed/BPF 需求） |
+| `mmcblk0_GPT.bin` | 从设备 /dev/mmcblk0 直接 dd 出来的完整 GPT 备份（34 扇区） |
 | `uboot-chenxin-er.bin` | chenxin527 编译的 U-Boot（gl.inet 风格，仅认 6M/12M 内核） |
-| `uboot.bin` | 其他版本 U-Boot hugo大佬的uboot不带dhcp|
+| `uboot.bin` | 其他版本 U-Boot（hugo 大佬的 uboot，不带 dhcp）|
 | `chenxin.txt` | [chenxin527/uboot-ipq60xx-emmc-build](https://github.com/chenxin527/uboot-ipq60xx-emmc-build) 源码分析 |
-| `xiaozhu.txt` | [1980490718/u-boot-2016](https://github.com/1980490718/u-boot-2016) 源码分析 |
+| `xiaozhu.txt` | [1980490718/u-boot-2016](https://github.com/1980490718/u-boot-2016) 源码分析（侧重使用） |
+| `分析.txt` | [1980490718/u-boot-2016](https://github.com/1980490718/u-boot-2016) 完整启动流程与固件升级机制分析（侧重源码） |
 | `教程.txt` | 完整刷写教程（三种方案） |
 | `README.md` | 本文件 |
 
@@ -65,8 +65,8 @@
 | # | 名称 | 起始 LBA | 结束 LBA | 大小 | 变化 |
 |---|------|---------|---------|------|------|
 | 0-14 | 同原始布局 | — | — | — | 不变 |
-| **15** | **0:HLOS** | **16930** | **41505** | **12M 🔺** | **从 6MB 翻倍** |
-| **16** | **0:HLOS_1** | **41506** | **53793** | **6M 🆕** | **新增备份内核** |
+| **15** | **0:HLOS** | **16930** | **41505** | **12M** | **从 6MB 翻倍** |
+| **16** | **0:HLOS_1** | **41506** | **53793** | **6M** | **新增备份内核** |
 | **17** | **rootfs** | **53794** | **2150945** | **1.0G** | 起始偏移调整 |
 | **18** | **storage** | **2150946** | **15269854** | **~6.3G** | 原 primary 更名 |
 
@@ -91,7 +91,7 @@
 
 **局限性**：如果 GPT 中 HLOS 是 12MB，但上传的固件也是 12MB，可以正常工作。但如果 HLOS 是 6MB 且固件是 12MB，校验会卡住。反过来 HLOS 12MB 但传 6MB 固件没问题。
 
-### [xiaozhu.txt](./xiaozhu.txt) — 1980490718/u-boot-2016
+### [xiaozhu.txt](./xiaozhu.txt) — 1980490718/u-boot-2016（使用层分析）
 
 增强型 U-Boot，核心文件 `lib/ipq_api.c`：
 
@@ -107,7 +107,17 @@
   - PHY 链路监测：断线自动重连
   - initramfs 启动支持
 
-**推荐使用此版本**，因为它能自动适应不同的内核大小，对 GPT 修改的兼容性更好。
+### [分析.txt](./分析.txt) — 1980490718/u-boot-2016（源码层分析）
+
+从源码角度完整梳理 U-Boot 启动流程与固件升级机制：
+
+- **启动流程**：Phase 1~5，从复位向量到 main_loop 的完整调用链
+- **HTTPD 恢复模式**：Reset 键触发、网络配置、支持上传的文件类型（Firmware/UBOOT/GPT/ART/CDT 等）
+- **固件结构**：FIT image + SquashFS 拼接格式解析，`check_fw_type_ex()` 内核大小自动检测机制
+- **A/B 双槽机制**：SMEM BOOTCONFIG 结构、update_bootconfig() 实现、主备切换逻辑
+- **HLOS 扩容兼容性分析**：扫描上限 16MB、分区大小校验、rootfs 定位不受 LBA 偏移影响
+
+**推荐阅读顺序**：先看 `xiaozhu.txt` 了解功能，再读 `分析.txt` 深入源码实现。
 
 ### 对比总结
 
@@ -117,6 +127,7 @@
 | 分区大小来源 | 硬编码比较 | 动态读取 GPT/SMEM |
 | 固件类型 | 含 JDCLOUD 专用 | 标准类型 |
 | 升级兼容性 | 只认 6M/12M | 自动适应任意大小 |
+| A/B 双槽刷写 | 仅 HLOS + rootfs | HLOS + rootfs + HLOS_1 + rootfs_1 + BOOTCONFIG |
 | GPIO 控制 | 仅 LED/Button | 完整 gpio 命令 |
 | initramfs | 不支持 | 支持 |
 | PHY 监测 | 无 | 有，自动重连 |
@@ -129,9 +140,9 @@
 
 | 方案 | 安全性 | 复杂度 | 适用场景 |
 |------|--------|--------|----------|
-| **initramfs 过渡** | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | 新手 / 首次操作，先让系统运行在内存再改 GPT |
-| **SSH 一步到位** | ⭐⭐⭐ | ⭐⭐ | 老手快速操作，直接在运行系统中用 sgdisk 改分区 |
-| **HTTPD 分步刷** | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ | 最稳妥的远程操作，U-Boot 网页上传 GPT + 固件 |
+| **initramfs 过渡** | 最高 | 中 | 新手 / 首次操作，先让系统运行在内存再改 GPT |
+| **SSH 一步到位** | 中 | 低 | 老手快速操作，直接在运行系统中用 sgdisk 改分区 |
+| **HTTPD 分步刷** | 高 | 中 | 最稳妥的远程操作，U-Boot 网页上传 GPT + 固件 |
 
 **所有操作前请务必备份当前 GPT：**
 
@@ -147,8 +158,8 @@ dd if=/dev/mmcblk0 of=/tmp/emmc_backup.bin bs=512 count=34
 1. **编译**支持 daed 的 OpenWRT 固件（内核大小选 12MB）
 2. **刷 U-Boot**：推荐 1980490718 版本，支持自动检测内核大小
    ```bash
-   mtd write /tmp/u-boot.bin APPSBL
-   mtd write /tmp/u-boot.bin APPSBL_1
+   dd if=uboot.bin of=/dev/mmcblk0 bs=512 seek=13346 count=1280 conv=fsync
+   dd if=uboot.bin of=/dev/mmcblk0 bs=512 seek=14626 count=1280 conv=fsync
    ```
 3. **重启进 U-Boot HTTPD**（长按 Reset 键约 5 秒）
 4. **上传 GPT**：在网页选择 GPT 类型，上传 `JDC-TAIYI-1GB-GPT-MODIFIED.bin`
@@ -158,14 +169,14 @@ dd if=/dev/mmcblk0 of=/tmp/emmc_backup.bin bs=512 count=34
 
 ---
 
-## 参考链接
+## 相关项目
 
+- [yufanpin/cdt-gpt-ipq60xx-generate](https://github.com/yufanpin/cdt-gpt-ipq60xx-generate) — Python 3 GPT 生成器（可自定义分区大小、无需 QSDK 工具链）
 - [chenxin527/uboot-ipq60xx-emmc-build](https://github.com/chenxin527/uboot-ipq60xx-emmc-build) — 6M/12M 硬编码 U-Boot（emmc 版）
 - [chenxin527/uboot-ipq60xx-nand-build](https://github.com/chenxin527/uboot-ipq60xx-nand-build) — NAND 版
 - [chenxin527/uboot-ipq60xx-nor-build](https://github.com/chenxin527/uboot-ipq60xx-nor-build) — NOR 版
 - [1980490718/u-boot-2016](https://github.com/1980490718/u-boot-2016) — 增强型 U-Boot（推荐）
 - [VIKINGYFY/OpenWRT-CI](https://github.com/VIKINGYFY/OpenWRT-CI) — 上游 OpenWRT 自动编译 CI
-- [kenzok8/openwrt-daede](https://github.com/kenzok8/openwrt-daede) — dae/daed 包（需求来源）
 
 ---
 
@@ -173,9 +184,10 @@ dd if=/dev/mmcblk0 of=/tmp/emmc_backup.bin bs=512 count=34
 
 | 项目 | 值 |
 |------|-----|
-| 型号 | JDCloud AX1800 (RE-CS-02) |
-| SoC | IPQ6000 (Qualcomm IPQ60xx) |
-| RAM | 512MB |
-| eMMC | 7.3GB / 115GB（因批次而异） |
-| U-Boot 位置 | mtd 分区 0:APPSBL / 0:APPSBL_1 |
-| 原始 GPT | 18 分区，7.3GB 磁盘几何 |
+| 型号 | JDCloud AX1800 Pro (RE-CS-07) |
+| SoC | IPQ6018 (Qualcomm IPQ60xx) |
+| RAM | 512MB DDR3 |
+| eMMC | 7.3GiB（15269888 扇区） |
+| GPT 分区 | 34 扇区标准 GPT dump |
+| U-Boot 位置 | mmcblk0 LBA 13346 (0:APPSBL) / LBA 14626 (0:APPSBL_1) |
+| 原始 firmware | OpenWRT / ImmortalWRT |
