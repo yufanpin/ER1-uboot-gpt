@@ -1,0 +1,61 @@
+# 1980490718/u-boot-2016 源码分析
+
+## 仓库信息
+- URL: https://github.com/1980490718/u-boot-2016
+- 分支: main, dev, NHSS.QSDK.12.5
+
+## 核心文件: lib/ipq_api.c (替代了 chenxin527 的 gl_api.c)
+
+### 固件类型检测增强版 check_fw_type_ex()
+```c
+struct fw_info check_fw_type_ex(void *address) {
+    // 按偏移量递增顺序检测 HLOS 实际大小
+    // 检测位置: 0x400000(4MB), 0x600000(6MB), 0x800000(8MB),
+    //           0xC00000(12MB), 0xE00000(14MB), 0x1000000(16MB)
+    // 检测魔数: MAGIC_HSQS = 0x73717368 ("hsqs" = squashfs)
+}
+```
+
+- 不硬编码 6MB/12MB，而是自动检测 4MB~16MB 共 6 种规格
+- 返回 struct fw_info {int type; unsigned int hlos_size;}
+
+### 固件类型 enum
+- FW_TYPE_FIT = 0
+- FW_TYPE_GPT = 1  
+- FW_TYPE_QSDK = 2
+- FW_TYPE_UBI = 3
+- FW_TYPE_CDT = 4
+- FW_TYPE_ELF = 5
+- FW_TYPE_MIBIB = 6
+- (无 JDCLOUD 专用类型)
+
+### EMMC 固件升级流程 (net/httpd.c -> do_firmware_upgrade)
+1. check_fw_type() 确认是 FIT
+2. check_fw_type_ex() 获取实际 HLOS 大小（自动检测）
+3. get_hlos_size() 从 GPT/SMEM 读分区实际大小
+4. 限制写入大小不超分区容量
+5. 执行: flash 0:HLOS → flash rootfs → flash 0:HLOS_1 → flash rootfs_1
+6. 更新 BOOTCONFIG
+
+### 分区信息读取
+- get_smem_table_size_bytes(): 优先查 SMEM 表，GPT 作为回退
+- get_hlos_size() / get_rootfs_size(): 通过宏自动生成
+- 支持 NOR/SPI/NAND/EMMC 多种闪存类型
+
+### 其他特性
+- gpio 命令行: 运行时查询/控制 GPIO
+- btn_check_press(): 按键检测 → 3秒进 httpd 恢复模式
+- led_init()/led_blink(): 更完善的 LED 控制
+- eth_check_link_change(): PHY 链路状态监测，断线自动重连
+- initramfs 启动支持
+
+## 与 chenxin527 对比
+
+| 特性 | chenxin527 | 1980490718 |
+|------|-----------|------------|
+| HLOS 检测 | 仅 6MB/12MB 硬编码 | 4MB~16MB 自动检测 |
+| 分区大小来源 | 硬编码比较 | 动态读取 GPT/SMEM |
+| 固件类型 | 含 JDCLOUD 专用 | 标准类型，无专有 |
+| 升级兼容性 | 只认 6M/12M + JDCloud | 自动适应任意 HLOS 大小 |
+| GPIO 控制 | 仅有 led/button | 完整 gpio 命令 + led/button |
+| PHY 监测 | 无 | 有，自动重连 |
