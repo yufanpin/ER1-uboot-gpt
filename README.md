@@ -9,7 +9,7 @@
 | 文件 | 说明 |
 |------|------|
 | `JDC-TAIYI-1GB-GPT.bin` | 原始 GPT 导出的 34 扇区镜像（18 个分区，HLOS = 6MB，1GB rootfs） |
-| `JDC-TAIYI-1GB-GPT-MODIFIED.bin` | 修改版 GPT（HLOS 扩至 12MB + 新增 HLOS_1 备份分区，适应 daed/BPF 需求） |
+| `gpt_main0-re-cs-07 (1).bin` | 修改版 GPT（HLOS 扩至 12MB + 新增 HLOS_1 备份分区，适应 daed/BPF 需求） |
 | `mmcblk0_GPT.bin` | 从设备 /dev/mmcblk0 直接 dd 出来的完整 GPT 备份（34 扇区） |
 | `uboot-chenxin-er.bin` | chenxin527 编译的 U-Boot（gl.inet 风格，仅认 6M/12M 内核） |
 | `uboot.bin` | 其他版本 U-Boot（hugo 大佬的 uboot，不带 dhcp）|
